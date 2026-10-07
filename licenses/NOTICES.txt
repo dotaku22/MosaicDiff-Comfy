@@ -1,0 +1,46 @@
+This folder ships with the custom nodes. Keep it when you share them.
+
+custom_nodes\ComfyUI-MosaicDiff\models\rfdetr.onnx
+  Mosaic detector, RF-DETR v6.
+  Copyright 2026 Kruk2
+  License: Apache-2.0 (Apache-2.0.txt)
+  The network architecture is Roboflow RF-DETR 1.8.3, also Apache-2.0:
+  https://github.com/roboflow/rf-detr
+
+custom_nodes\ComfyUI-MosaicDiff\loras\DecensoreH3_000002500.safetensors
+  Decensore LoRA for this restoration. It is included because it is not
+  published anywhere else. Strength in the workflow is 1.
+
+custom_nodes\ComfyUI-MosaicDiff\mosaicdiff\basicvsr
+  Copyright Lada Authors
+  License: AGPL-3.0 (AGPL-3.0.txt)
+  https://github.com/ladaapp/lada
+
+custom_nodes\ComfyUI-MosaicDiff\mosaicdiff\basicvsr\mmagic
+  Copyright OpenMMLab. All rights reserved.
+  License: Apache-2.0 AND AGPL-3.0 (Apache-2.0.txt and AGPL-3.0.txt)
+  https://github.com/open-mmlab/mmagic
+
+custom_nodes\comfyui_nvidia_rtx_nodes
+  NVIDIA RTX nodes for ComfyUI.
+  License: Apache-2.0 (see that folder's LICENSE)
+  https://github.com/Comfy-Org/Nvidia_RTX_Nodes_ComfyUI
+
+ONNX Runtime, used to run rfdetr.onnx
+  Copyright (c) Microsoft Corporation
+  License: MIT (MIT-ONNX-Runtime.txt)
+  https://github.com/microsoft/onnxruntime
+
+You still download these yourself. Each file keeps the license of its source.
+
+basicvsr.pth
+  Lada BasicVSR++ mosaic restoration checkpoint.
+  https://huggingface.co/ladaapp/lada
+  License: AGPL-3.0
+
+10Eros_Max_h3_TURBO-hybrid_beta5_int8.safetensors
+  https://huggingface.co/TenStrip/10Eros-Max
+
+qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors
+minimax_h3_video_vae_fp16.safetensors
+  https://huggingface.co/Comfy-Org/MiniMax-H3
