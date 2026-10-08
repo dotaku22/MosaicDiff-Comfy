@@ -28,7 +28,16 @@ pip install -r custom_nodes/ComfyUI-MosaicDiff/requirements.txt
 pip install -r custom_nodes/comfyui_nvidia_rtx_nodes/requirements.txt
 ```
 
-Install `mmengine` with `--no-deps` so it does not replace ComfyUI's PyTorch. If `onnxruntime`, `opencv-python`, or `av` are already installed, leave them.
+Install `mmengine` with `--no-deps` so it does not replace ComfyUI's PyTorch. If `opencv-python` or `av` are already installed, leave them.
+
+The detector needs `onnxruntime-gpu`. The plain `onnxruntime` package only runs on the CPU, and the two packages conflict. Uninstall the plain package first:
+
+```
+python -m pip uninstall -y onnxruntime
+python -m pip install -r custom_nodes/ComfyUI-MosaicDiff/requirements.txt
+```
+
+The log should say `Detector model on CUDAExecutionProvider`.
 
 Restart ComfyUI. Open the workflow **MosaicDiff** and choose the clip on **Load Video**.
 
