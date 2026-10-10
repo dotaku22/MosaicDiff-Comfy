@@ -1,4 +1,4 @@
-"""BasicVSR++ on the mosaic, then MiniMax H3 on one locked crop."""
+"""BasicVSR++ on the mosaic, then MiniMax H3 on each sample's own crop."""
 
 from __future__ import annotations
 
@@ -156,7 +156,7 @@ def _paste(frame: np.ndarray, patch: np.ndarray, box) -> np.ndarray:
     return base
 
 
-def _write_output(vsr_path, destination, pastes, crop, output_fps, source_fps, frame_count: int) -> None:
+def _write_output(vsr_path, destination, pastes, output_fps, source_fps, frame_count: int) -> None:
     capture, width, height, _fps, _count = open_capture(vsr_path)
     keep = set(frames_at_h3_fps(frame_count, source_fps)) if output_fps == H3_FPS else None
     writer = VideoWriter(destination, width, height, Fraction(output_fps).limit_denominator(1000))
@@ -169,8 +169,9 @@ def _write_output(vsr_path, destination, pastes, crop, output_fps, source_fps, f
             if keep is not None and index not in keep:
                 index += 1
                 continue
-            image_path = pastes.get(index)
-            if image_path is not None:
+            entry = pastes.get(index)
+            if entry is not None:
+                image_path, crop = entry
                 patch = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
                 if patch is not None:
                     frame = _paste(frame, patch, crop)

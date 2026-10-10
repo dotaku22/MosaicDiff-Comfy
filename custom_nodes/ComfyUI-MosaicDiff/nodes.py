@@ -181,7 +181,7 @@ class MosaicDiffPrepare:
         import folder_paths
 
         from mosaicdiff.detect import Detector
-        from mosaicdiff.geometry import expand_box, fit_context, frames_at_h3_fps, generation_size, split_samples, stable_crop
+        from mosaicdiff.geometry import expand_box, fit_context, frames_at_h3_fps, generation_size, split_samples, window_crops
         from mosaicdiff.pipeline import _detect, _restore_video
         from mosaicdiff.vsr import load_restorer
 
@@ -216,34 +216,44 @@ class MosaicDiffPrepare:
             del restorer
             torch.cuda.empty_cache()
 
-        crop = [int(value) for value in stable_crop([box for box in grown if box is not None], width, height)]
         present = [index for index, box in enumerate(grown) if box is not None]
         span = frames_at_h3_fps(present[-1] - present[0] + 1, fps)
         sampled = [present[0] + index for index in span]
         windows = split_samples(sampled)
         if not windows:
             raise RuntimeError("The restored section is shorter than 5 frames at 24 fps")
-        gen_w, gen_h = generation_size(crop[2] - crop[0], crop[3] - crop[1], int(resolution))
-        context, overlap = fit_context(float(context_seconds), max(len(window) for window in windows))
-        _log(
-            f"H3 crop {crop[2] - crop[0]}x{crop[3] - crop[1]} at {crop[0]},{crop[1]}, "
-            f"{len(windows)} sample(s), {gen_w}x{gen_h}"
-        )
-        first = [int(index) for index in windows[0]]
-        reference = _frames_from_crops(_read_crops(vsr_video, first, crop), first)
+        specs = []
+        for indices, crop in zip(windows, window_crops(grown, windows, width, height)):
+            gen_w, gen_h = generation_size(crop[2] - crop[0], crop[3] - crop[1], int(resolution))
+            specs.append(
+                {
+                    "frame_indices": [int(index) for index in indices],
+                    "crop": [int(value) for value in crop],
+                    "width": gen_w,
+                    "height": gen_h,
+                }
+            )
+            _log(
+                f"H3 crop {crop[2] - crop[0]}x{crop[3] - crop[1]} at {crop[0]},{crop[1]}, "
+                f"generation {gen_w}x{gen_h}"
+            )
+        context, overlap = fit_context(float(context_seconds), max(len(spec["frame_indices"]) for spec in specs))
+        first = specs[0]
+        first_indices = first["frame_indices"]
+        reference = _frames_from_crops(_read_crops(vsr_video, first_indices, first["crop"]), first_indices)
         prep = {
             "source": str(source),
             "vsr": str(vsr_video),
-            "crop": crop,
+            "crop": first["crop"],
             "fps": float(fps),
             "frame_count": len(boxes),
-            "windows": windows,
-            "width": gen_w,
-            "height": gen_h,
-            "prompt_frames": first,
+            "windows": specs,
+            "width": first["width"],
+            "height": first["height"],
+            "prompt_frames": first_indices,
         }
-        preview = _preview_frames(vsr_video, first, crop)
-        return (prep, reference, gen_w, gen_h, len(first), context, overlap, preview)
+        preview = _preview_frames(vsr_video, first_indices, first["crop"])
+        return (prep, reference, first["width"], first["height"], len(first_indices), context, overlap, preview)
 
 
 class MosaicDiffPinReference:
@@ -309,31 +319,38 @@ class MosaicDiffPlace:
         from mosaicdiff.videoio import copy_audio
 
         windows = prep["windows"]
-        crop = [int(value) for value in prep["crop"]]
-        crop_w = crop[2] - crop[0]
-        crop_h = crop[3] - crop[1]
-        gen_w = int(prep["width"])
-        gen_h = int(prep["height"])
         job = _job()
         job["prompt"] = prompt
         source = Path(prep["source"])
         vsr_video = Path(prep["vsr"])
         destination = unique_path(Path(folder_paths.get_output_directory()) / f"{source.stem}_mosaicdiff.mp4")
-        first = [int(index) for index in windows[0]]
-        if int(images.shape[0]) != len(first):
-            raise RuntimeError(f"Sampler returned {int(images.shape[0])} frames, expected {len(first)}")
+        first = windows[0]
+        first_indices = [int(index) for index in first["frame_indices"]]
+        if int(images.shape[0]) != len(first_indices):
+            raise RuntimeError(f"Sampler returned {int(images.shape[0])} frames, expected {len(first_indices)}")
 
         with tempfile.TemporaryDirectory(prefix="mosaicdiff-", dir=str(destination.parent)) as temp_name:
             temp = Path(temp_name)
-            fitted = _rtx_fit(job, images, gen_w, gen_h, crop_w, crop_h)
-            specs = [{"frame_indices": first, "out_dir": str(temp / "window_000")}]
-            _save_pngs(fitted, Path(specs[0]["out_dir"]))
+            first_crop = [int(value) for value in first["crop"]]
+            fitted = _rtx_fit(
+                job,
+                images,
+                int(first["width"]),
+                int(first["height"]),
+                first_crop[2] - first_crop[0],
+                first_crop[3] - first_crop[1],
+            )
+            written = [{"frame_indices": first_indices, "crop": first_crop, "out_dir": str(temp / "window_000")}]
+            _save_pngs(fitted, Path(written[0]["out_dir"]))
             del fitted
             loaded = {"torch": torch, "vae": vae}
             decode = VAEDecode()
-            for number, indices in enumerate(windows[1:], start=1):
+            for number, spec in enumerate(windows[1:], start=1):
                 comfy.model_management.throw_exception_if_processing_interrupted()
-                indices = [int(index) for index in indices]
+                indices = [int(index) for index in spec["frame_indices"]]
+                crop = [int(value) for value in spec["crop"]]
+                gen_w = int(spec["width"])
+                gen_h = int(spec["height"])
                 _log(f"Sample {number + 1}/{len(windows)}")
                 frames = _frames_from_crops(_read_crops(vsr_video, indices, crop), indices)
                 conditioned = MiniMaxH3ReferenceToVideo.execute(
@@ -353,24 +370,24 @@ class MosaicDiffPlace:
                 with torch.no_grad():
                     sampled = SamplerCustomAdvanced.execute(noise, guider, sampler, sigmas, latent)[0]
                     decoded = decode.decode(vae, sampled)[0]
-                decoded = _rtx_fit(job, decoded, gen_w, gen_h, crop_w, crop_h)
+                decoded = _rtx_fit(job, decoded, gen_w, gen_h, crop[2] - crop[0], crop[3] - crop[1])
                 out_dir = temp / f"window_{number:03d}"
                 _save_pngs(decoded, out_dir)
-                specs.append({"frame_indices": indices, "out_dir": str(out_dir)})
+                written.append({"frame_indices": indices, "crop": crop, "out_dir": str(out_dir)})
                 del frames, positive, latent, sampled, decoded
             pastes = {}
-            for spec in specs:
+            for spec in written:
                 out_dir = Path(spec["out_dir"])
+                crop = tuple(spec["crop"])
                 for order, frame_idx in enumerate(spec["frame_indices"]):
                     image = out_dir / f"{order:06d}.png"
                     if image.is_file():
-                        pastes[int(frame_idx)] = image
+                        pastes[int(frame_idx)] = (image, crop)
             output_fps = H3_FPS if float(prep["fps"]) > H3_FPS + 0.05 else float(prep["fps"])
             _write_output(
                 vsr_video,
                 destination,
                 pastes,
-                tuple(crop),
                 output_fps,
                 float(prep["fps"]),
                 int(prep["frame_count"]),
