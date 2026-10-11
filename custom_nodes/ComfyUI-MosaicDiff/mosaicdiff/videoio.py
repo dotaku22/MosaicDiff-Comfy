@@ -2,12 +2,62 @@
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 from fractions import Fraction
 from pathlib import Path
 
 import av
 import cv2
 import numpy as np
+
+
+def _rate(fps: Fraction) -> str:
+    fps = Fraction(fps)
+    if fps.denominator == 1:
+        return str(fps.numerator)
+    return f"{fps.numerator}/{fps.denominator}"
+
+
+def _nvenc_process(path: Path, width: int, height: int, fps: Fraction):
+    """Jasna encodes with NVENC. PyAV's bundled copy cannot open that encoder."""
+    if width < 256 or height < 144:
+        return None
+    exe = shutil.which("ffmpeg")
+    if not exe:
+        return None
+    return subprocess.Popen(
+        [
+            exe,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            f"{width}x{height}",
+            "-r",
+            _rate(fps),
+            "-i",
+            "-",
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            "p4",
+            "-rc",
+            "vbr",
+            "-cq",
+            "19",
+            "-pix_fmt",
+            "yuv420p",
+            str(path),
+        ],
+        stdin=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
 
 
 def open_capture(path: Path):
@@ -26,23 +76,42 @@ class VideoWriter:
         self.path = path
         self.width = width - width % 2
         self.height = height - height % 2
+        self._process = _nvenc_process(path, self.width, self.height, fps)
+        self.container = None
+        self.stream = None
+        if self._process is not None:
+            self.codec = "h264_nvenc"
+            print("Encoding with h264_nvenc", flush=True)
+            return
+        self.codec = "libx264"
         self.container = av.open(str(path), mode="w")
         self.stream = self.container.add_stream("libx264", rate=fps)
         self.stream.width = self.width
         self.stream.height = self.height
         self.stream.pix_fmt = "yuv420p"
         self.stream.options = {"crf": "18", "preset": "veryfast"}
+        print("Encoding with libx264", flush=True)
 
     def write(self, bgr: np.ndarray) -> None:
         frame = bgr[: self.height, : self.width]
         if frame.shape[0] != self.height or frame.shape[1] != self.width:
             frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_AREA)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        if self._process is not None:
+            self._process.stdin.write(np.ascontiguousarray(rgb).tobytes())
+            return
         video = av.VideoFrame.from_ndarray(rgb, format="rgb24")
         for packet in self.stream.encode(video):
             self.container.mux(packet)
 
     def close(self) -> None:
+        if self._process is not None:
+            self._process.stdin.close()
+            error = self._process.stderr.read().decode("utf-8", errors="replace").strip()
+            code = self._process.wait()
+            if code != 0:
+                raise RuntimeError(error or f"NVENC encoder exited with status {code}")
+            return
         for packet in self.stream.encode():
             self.container.mux(packet)
         self.container.close()

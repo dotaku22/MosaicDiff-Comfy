@@ -30,11 +30,17 @@ def _cuda_libraries() -> None:
         os.add_dll_directory(str(lib))
 
 
-def _providers() -> list[str]:
+def _providers(device: torch.device) -> list:
     import onnxruntime as ort
 
     available = set(ort.get_available_providers())
-    chosen = [name for name in _PROVIDER_ORDER if name in available]
+    chosen = []
+    if device.type == "cuda" and "CUDAExecutionProvider" in available:
+        chosen.append("CUDAExecutionProvider")
+    for name in _PROVIDER_ORDER:
+        if name == "CUDAExecutionProvider" or name not in available:
+            continue
+        chosen.append(name)
     return chosen or ["CPUExecutionProvider"]
 
 
@@ -50,7 +56,7 @@ class Detector:
         self.device = device
         self.score_threshold = float(score_threshold)
         _cuda_libraries()
-        self.session = ort.InferenceSession(str(model_path), providers=_providers())
+        self.session = ort.InferenceSession(str(model_path), providers=_providers(device))
         self.provider = self.session.get_providers()[0]
         model_input = self.session.get_inputs()[0]
         self.input_name = model_input.name
@@ -60,7 +66,7 @@ class Detector:
             self.batch = batch
             self._fixed_batch = True
         else:
-            self.batch = 4
+            self.batch = 16
             self._fixed_batch = False
         resolution = shape[-1] if shape else 576
         self.resolution = int(resolution) if isinstance(resolution, int) and resolution > 0 else 576
@@ -73,8 +79,12 @@ class Detector:
         if not frames_bgr:
             return []
         height, width = frames_bgr[0].shape[:2]
-        batch = self._preprocess(frames_bgr)
-        outputs = self._infer(batch)
+        if self.provider == "CUDAExecutionProvider":
+            batch = self._preprocess_cuda(frames_bgr)
+            outputs = self._infer_cuda(batch)
+        else:
+            batch = self._preprocess(frames_bgr)
+            outputs = self._infer(batch)
         boxes, scores = self._decode(outputs, (height, width), len(frames_bgr))
         chosen: list[tuple[int, int, int, int] | None] = []
         for frame_boxes, frame_scores in zip(boxes, scores):
@@ -105,6 +115,37 @@ class Detector:
             pad = np.repeat(array[-1:], self.batch - count, axis=0)
             array = np.concatenate((array, pad), axis=0)
         return np.ascontiguousarray(array)
+
+    def _preprocess_cuda(self, frames_bgr: list[np.ndarray]) -> torch.Tensor:
+        stacked = torch.from_numpy(np.stack(frames_bgr))
+        images = stacked.permute(0, 3, 1, 2)[:, [2, 1, 0]].contiguous()
+        images = images.to(device=self.device, dtype=torch.float32).div_(255.0)
+        images = torch.nn.functional.interpolate(
+            images,
+            size=(self.resolution, self.resolution),
+            mode="bilinear",
+            align_corners=False,
+        )
+        mean = images.new_tensor(_MEAN)[None, :, None, None]
+        std = images.new_tensor(_STD)[None, :, None, None]
+        return ((images - mean) / std).contiguous()
+
+    def _infer_cuda(self, batch: torch.Tensor) -> dict[str, torch.Tensor]:
+        binding = self.session.io_binding()
+        device_id = int(self.device.index or 0)
+        binding.bind_input(
+            self.input_name,
+            device_type="cuda",
+            device_id=device_id,
+            element_type=np.float32,
+            shape=tuple(batch.shape),
+            buffer_ptr=batch.data_ptr(),
+        )
+        for name in self.output_names:
+            binding.bind_output(name, "cuda", device_id)
+        self.session.run_with_iobinding(binding)
+        copied = binding.copy_outputs_to_cpu()
+        return {name: torch.from_numpy(np.asarray(value)) for name, value in zip(self.output_names, copied)}
 
     def _infer(self, batch: np.ndarray) -> dict[str, torch.Tensor]:
         values = self.session.run(self.output_names, {self.input_name: batch})

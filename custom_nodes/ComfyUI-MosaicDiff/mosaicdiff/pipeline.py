@@ -1,7 +1,11 @@
-"""BasicVSR++ on the mosaic, then MiniMax H3 on each sample's own crop."""
+"""BasicVSR++ on the mosaic, then MiniMax H3 on a square that follows it."""
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import tempfile
 from fractions import Fraction
 from pathlib import Path
 
@@ -10,13 +14,21 @@ import numpy as np
 
 from mosaicdiff.geometry import (
     H3_FPS,
+    align_down,
     edge_fade,
+    expand_box,
+    fit_context,
     frames_at_h3_fps,
+    generation_size,
     letterbox,
+    squares_for_frames,
 )
-from mosaicdiff.videoio import VideoWriter, open_capture
+from mosaicdiff.paths import nodes_dir, worker_script
+from mosaicdiff.settings import Settings
+from mosaicdiff.videoio import VideoWriter, copy_audio, open_capture
 from mosaicdiff.vsr import restore_squares
 
+PROMPT = "Restore the vulva or penis the reference video"
 CHUNK = 90
 OVERLAP = 4
 
@@ -35,6 +47,72 @@ def unique_path(path: Path) -> Path:
         if not candidate.exists():
             return candidate
         number += 1
+
+
+def process_video(
+    source: Path,
+    destination: Path,
+    settings: Settings,
+    log,
+    progress,
+    cancel,
+) -> Path:
+    missing = settings.missing()
+    if missing:
+        listed = ", ".join(label for label, _path in missing)
+        raise FileNotFoundError(f"Missing model files: {listed}")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination = unique_path(destination)
+    import torch
+
+    device = torch.device("cuda:0")
+    if not torch.cuda.is_available():
+        raise RuntimeError("MosaicDiff needs an NVIDIA GPU")
+
+    from mosaicdiff.detect import Detector
+    from mosaicdiff.vsr import load_restorer
+
+    log(f"Detecting mosaic in {source.name}")
+    detector = Detector(settings.resolved("detector"), device)
+    log(f"Detector model on {detector.provider}")
+    try:
+        boxes, width, height, fps, _count = _detect(source, detector, log, progress, cancel)
+    finally:
+        detector.close()
+        torch.cuda.empty_cache()
+
+    present = [box for box in boxes if box is not None]
+    if not present:
+        raise RuntimeError(f"No mosaic found in {source.name}")
+
+    grown = []
+    for box in boxes:
+        if box is None:
+            grown.append(None)
+        else:
+            grown.append(expand_box(*box, height, width))
+
+    log(f"BasicVSR++ on {len(present)} frames")
+    restorer = load_restorer(settings.resolved("vsr"), device)
+    vsr_path = destination.with_name(destination.stem + ".vsr" + destination.suffix)
+    try:
+        _restore_video(source, vsr_path, grown, restorer, device, fps, progress, cancel)
+    finally:
+        del restorer
+        torch.cuda.empty_cache()
+
+    try:
+        _h3(source, vsr_path, destination, settings, grown, width, height, fps, log, progress, cancel)
+    except Cancelled:
+        vsr_path.unlink(missing_ok=True)
+        raise
+    except Exception:
+        log(f"H3 stopped. The BasicVSR++ video is still at {vsr_path.name}")
+        raise
+    vsr_path.unlink(missing_ok=True)
+    progress(1.0, "Done")
+    return destination
 
 
 def _check(cancel) -> None:
@@ -156,6 +234,125 @@ def _paste(frame: np.ndarray, patch: np.ndarray, box) -> np.ndarray:
     return base
 
 
+def _h3(source, vsr_path, destination, settings: Settings, boxes, width, height, fps, log, progress, cancel) -> None:
+    present = [index for index, box in enumerate(boxes) if box is not None]
+    first, last = present[0], present[-1]
+    span = frames_at_h3_fps(last - first + 1, fps)
+    sampled = [first + index for index in span]
+    kept = align_down(len(sampled))
+    if kept < 5:
+        raise RuntimeError("The restored section is shorter than 5 frames at 24 fps")
+    if kept != len(sampled):
+        log(f"H3 keeps {kept} of {len(sampled)} frames so the length matches the model")
+    sampled = sampled[:kept]
+    crops = squares_for_frames(boxes, sampled, width, height)
+    side = crops[0][2] - crops[0][0]
+    context, overlap = fit_context(settings.h3_seconds, len(sampled))
+    gen_w, gen_h = generation_size(side, side, settings.h3_resolution)
+    later = crops[min(100, len(crops) - 1)]
+    log(
+        f"MiniMax H3, {len(sampled)} frames, "
+        f"square {side}x{side} follows the mosaic, "
+        f"generation {gen_w}x{gen_h}, context {context}, "
+        f"first at {crops[0][0]},{crops[0][1]}, "
+        f"frame {min(100, len(crops) - 1)} at {later[0]},{later[1]}"
+    )
+    progress(0.58, "MiniMax H3")
+    with tempfile.TemporaryDirectory(prefix="mosaicdiff-", dir=str(destination.parent)) as temp_name:
+        temp = Path(temp_name)
+        out_dir = temp / "window_000"
+        out_dir.mkdir()
+        specs = [
+            {
+                "frame_indices": sampled,
+                "width": gen_w,
+                "height": gen_h,
+                "crop": list(crops[0]),
+                "crops": [list(crop) for crop in crops],
+                "out_dir": str(out_dir),
+                "context_frames": context,
+                "context_overlap": overlap,
+            }
+        ]
+        job = {
+            "comfy_root": str(settings.resolved("comfy_root")),
+            "nodes_dir": str(nodes_dir()),
+            "unet": str(settings.resolved("unet")),
+            "lora": str(settings.resolved("lora")),
+            "clip": str(settings.resolved("clip")),
+            "video_vae": str(settings.resolved("vae")),
+            "prompt": PROMPT,
+            "seed": 0,
+            "steps": 8,
+            "video": str(vsr_path),
+            "windows": specs,
+        }
+        job_path = temp / "job.json"
+        job_path.write_text(json.dumps(job), encoding="utf-8")
+        _run_comfy(settings.resolved("comfy_python"), job_path, log, cancel)
+        progress(0.9, "Writing")
+        pastes = {}
+        for spec in specs:
+            out_dir = Path(spec["out_dir"])
+            frame_crops = spec.get("crops") or [spec["crop"]] * len(spec["frame_indices"])
+            for order, frame_idx in enumerate(spec["frame_indices"]):
+                image = out_dir / f"{order:06d}.png"
+                if image.is_file():
+                    pastes[int(frame_idx)] = (image, tuple(frame_crops[order]))
+        output_fps = H3_FPS if fps > H3_FPS + 0.05 else fps
+        _write_output(vsr_path, destination, pastes, output_fps, fps, len(boxes))
+        if settings.compare:
+            compare_path = destination.with_name(destination.stem + "_compare" + destination.suffix)
+            try:
+                _write_compare(source, destination, compare_path, fps)
+                log(f"Comparison {compare_path.name}")
+            except Exception as exc:
+                compare_path.unlink(missing_ok=True)
+                log(f"Comparison was not written: {exc}")
+    with_audio = destination.with_name(destination.stem + ".audio" + destination.suffix)
+    try:
+        if copy_audio(destination, source, with_audio):
+            with_audio.replace(destination)
+    except Exception as exc:
+        with_audio.unlink(missing_ok=True)
+        log(f"Audio was not copied: {exc}")
+    log(f"Wrote {destination.name}")
+
+
+def _run_comfy(python: Path, job_path: Path, log, cancel) -> None:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = ""
+    env["PYTHONNOUSERSITE"] = "1"
+    env["PYTHONUTF8"] = "1"
+    process = subprocess.Popen(
+        [str(python), "-s", str(worker_script()), "--job", str(job_path)],
+        cwd=str(job_path.parent),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    assert process.stdout is not None
+    try:
+        for line in process.stdout:
+            _check(cancel)
+            text = line.rstrip()
+            if text and "%|" not in text:
+                log(text)
+    except Cancelled:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+        raise
+    code = process.wait()
+    if code != 0:
+        raise RuntimeError(f"MiniMax H3 process exited with status {code}")
+
+
 def _write_output(vsr_path, destination, pastes, output_fps, source_fps, frame_count: int) -> None:
     capture, width, height, _fps, _count = open_capture(vsr_path)
     keep = set(frames_at_h3_fps(frame_count, source_fps)) if output_fps == H3_FPS else None
@@ -171,8 +368,8 @@ def _write_output(vsr_path, destination, pastes, output_fps, source_fps, frame_c
                 continue
             entry = pastes.get(index)
             if entry is not None:
-                image_path, crop = entry
-                patch = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+                patch_source, crop = entry
+                patch = patch_source if isinstance(patch_source, np.ndarray) else cv2.imread(str(patch_source), cv2.IMREAD_COLOR)
                 if patch is not None:
                     frame = _paste(frame, patch, crop)
             writer.write(frame)
@@ -182,3 +379,39 @@ def _write_output(vsr_path, destination, pastes, output_fps, source_fps, frame_c
         writer.close()
 
 
+def _write_compare(source, restored, destination, source_fps) -> None:
+    original, _w, _h, _fps, original_count = open_capture(source)
+    result, width, height, _fps, restored_count = open_capture(restored)
+    if abs(source_fps - H3_FPS) > 0.05 and original_count != restored_count:
+        indices = frames_at_h3_fps(original_count, source_fps)
+    else:
+        indices = list(range(min(original_count, restored_count)))
+    wanted = set(indices)
+    writer = VideoWriter(destination, width * 2, height, Fraction(H3_FPS if len(indices) != original_count else source_fps).limit_denominator(1000))
+    index = 0
+    written = 0
+    try:
+        while written < len(indices):
+            ok, frame = original.read()
+            if not ok:
+                break
+            if index in wanted:
+                ok, right = result.read()
+                if not ok:
+                    break
+                left = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+                pair = np.concatenate((left, right[:height, :width]), axis=1)
+                _label(pair, "with mosaic", 16)
+                _label(pair, "without mosaic", width + 16)
+                writer.write(pair)
+                written += 1
+            index += 1
+    finally:
+        original.release()
+        result.release()
+        writer.close()
+
+
+def _label(image: np.ndarray, text: str, x: int) -> None:
+    cv2.putText(image, text, (x, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4, cv2.LINE_AA)
+    cv2.putText(image, text, (x, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 1, cv2.LINE_AA)

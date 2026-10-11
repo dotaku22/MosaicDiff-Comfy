@@ -2,7 +2,7 @@
   "id": "c4a91e20-7b16-4d55-8e2a-6f0c3b9a11d4",
   "revision": 0,
   "last_node_id": 21,
-  "last_link_id": 39,
+  "last_link_id": 42,
   "nodes": [
     {
       "id": 1,
@@ -17,7 +17,7 @@
       "title": "MosaicDiff",
       "properties": {},
       "widgets_values": [
-        "## MosaicDiff\n\nSame pass as the MosaicDiff program, using the normal Comfy nodes.\n\n1. Choose the clip on **Load Video**.\n2. **MosaicDiff Prepare** finds the mosaic and restores it with BasicVSR++.\n3. Eros Max, the Decensore LoRA, the text encoder, and the video VAE are the standard loaders.\n4. The sampler is euler, simple, 8 steps, seed 0, BasicGuider. Context windows are linked from Prepare (5 seconds).\n5. **MosaicDiff Place** fits the frames with RTX Video Super Resolution and pastes them back.\n\nA clip longer than one H3 sample keeps using this sampler, these sigmas, and this noise for the later samples.\n\nRestart ComfyUI once after these nodes are added."
+        "## MosaicDiff\n\n1. **MosaicDiff Prepare** finds the mosaic and restores it with BasicVSR++. The square stays on the mosaic.\n2. **MosaicDiff Reference** encodes that full square in short pieces and pins the border. **SamplerCustomAdvanced** repaints it. Context windows handle the length.\n3. **MosaicDiff Place** decodes the result in pieces and pastes it back into the full video.\n\nRestart ComfyUI after updating the nodes, then reload this workflow."
       ],
       "color": "#222",
       "bgcolor": "#000"
@@ -55,10 +55,10 @@
         {"name": "context_seconds", "type": "INT", "widget": {"name": "context_seconds"}, "link": null}
       ],
       "outputs": [
-        {"name": "prep", "type": "MOSAICDIFF_PREP", "links": [30]},
-        {"name": "reference", "type": "IMAGE", "links": [9, 15]},
-        {"name": "width", "type": "INT", "links": [11, 17]},
-        {"name": "height", "type": "INT", "links": [12, 18]},
+        {"name": "prep", "type": "MOSAICDIFF_PREP", "links": [30, 40]},
+        {"name": "reference", "type": "IMAGE", "links": []},
+        {"name": "width", "type": "INT", "links": [11]},
+        {"name": "height", "type": "INT", "links": [12]},
         {"name": "length", "type": "INT", "links": [13]},
         {"name": "context_length", "type": "INT", "links": [5]},
         {"name": "context_overlap", "type": "INT", "links": [6]},
@@ -134,7 +134,7 @@
         {"name": "device", "type": "COMBO", "widget": {"name": "device"}, "link": null}
       ],
       "outputs": [
-        {"name": "CLIP", "type": "CLIP", "links": [7, 32]}
+        {"name": "CLIP", "type": "CLIP", "links": [7]}
       ],
       "properties": {"Node name for S&R": "CLIPLoader"},
       "widgets_values": ["qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", "minimax", "default"]
@@ -151,7 +151,7 @@
         {"name": "vae_name", "type": "COMBO", "widget": {"name": "vae_name"}, "link": null}
       ],
       "outputs": [
-        {"name": "VAE", "type": "VAE", "links": [8, 16, 28, 33]}
+        {"name": "VAE", "type": "VAE", "links": [8, 42]}
       ],
       "properties": {"Node name for S&R": "VAELoader"},
       "widgets_values": ["minimax_h3_video_vae_fp16.safetensors"]
@@ -171,7 +171,7 @@
         {"name": "fuse_method", "type": "COMBO", "widget": {"name": "fuse_method"}, "link": null}
       ],
       "outputs": [
-        {"name": "MODEL", "type": "MODEL", "links": [24, 26, 31]}
+        {"name": "MODEL", "type": "MODEL", "links": [24, 26]}
       ],
       "properties": {"Node name for S&R": "MiniMaxH3ContextWindows"},
       "widgets_values": [124, 22, "pyramid"]
@@ -188,7 +188,7 @@
         {"name": "value", "type": "STRING", "widget": {"name": "value"}, "link": null}
       ],
       "outputs": [
-        {"name": "STRING", "type": "STRING", "links": [10, 37]}
+        {"name": "STRING", "type": "STRING", "links": [10]}
       ],
       "title": "Prompt",
       "properties": {"Node name for S&R": "PrimitiveStringMultiline"},
@@ -198,50 +198,27 @@
     },
     {
       "id": 11,
-      "type": "MiniMaxH3ReferenceToVideo",
+      "type": "MosaicDiffReference",
       "pos": [900, 190],
-      "size": [420, 360],
+      "size": [420, 280],
       "flags": {},
       "order": 10,
       "mode": 0,
       "inputs": [
         {"name": "clip", "type": "CLIP", "link": 7},
         {"name": "vae", "type": "VAE", "link": 8},
-        {"name": "audio_vae", "shape": 7, "type": "VAE", "link": null},
-        {"name": "ref_videos.ref_video_0", "type": "IMAGE", "link": 9},
         {"name": "prompt", "type": "STRING", "widget": {"name": "prompt"}, "link": 10},
+        {"name": "prep", "type": "MOSAICDIFF_PREP", "link": 40},
         {"name": "width", "type": "INT", "widget": {"name": "width"}, "link": 11},
         {"name": "height", "type": "INT", "widget": {"name": "height"}, "link": 12},
-        {"name": "length", "type": "INT", "widget": {"name": "length"}, "link": 13},
-        {"name": "ref_image_size", "type": "COMBO", "widget": {"name": "ref_image_size"}, "link": null}
+        {"name": "length", "type": "INT", "widget": {"name": "length"}, "link": 13}
       ],
       "outputs": [
         {"name": "positive", "type": "CONDITIONING", "links": [25]},
-        {"name": "LATENT", "type": "LATENT", "links": [14]}
+        {"name": "latent", "type": "LATENT", "links": [19]}
       ],
-      "properties": {"Node name for S&R": "MiniMaxH3ReferenceToVideo"},
-      "widgets_values": ["Restore the vulva or penis the reference video", 512, 512, 124, "match"]
-    },
-    {
-      "id": 12,
-      "type": "MosaicDiffPinReference",
-      "pos": [900, 590],
-      "size": [420, 160],
-      "flags": {},
-      "order": 11,
-      "mode": 0,
-      "inputs": [
-        {"name": "latent", "type": "LATENT", "link": 14},
-        {"name": "images", "type": "IMAGE", "link": 15},
-        {"name": "vae", "type": "VAE", "link": 16},
-        {"name": "width", "type": "INT", "widget": {"name": "width"}, "link": 17},
-        {"name": "height", "type": "INT", "widget": {"name": "height"}, "link": 18}
-      ],
-      "outputs": [
-        {"name": "LATENT", "type": "LATENT", "links": [19]}
-      ],
-      "properties": {"Node name for S&R": "MosaicDiffPinReference"},
-      "widgets_values": [512, 512]
+      "properties": {"Node name for S&R": "MosaicDiffReference"},
+      "widgets_values": ["Restore the vulva or penis the reference video", 512, 512, 124]
     },
     {
       "id": 13,
@@ -255,7 +232,7 @@
         {"name": "noise_seed", "type": "INT", "widget": {"name": "noise_seed"}, "link": null}
       ],
       "outputs": [
-        {"name": "NOISE", "type": "NOISE", "links": [20, 34]}
+        {"name": "NOISE", "type": "NOISE", "links": [20]}
       ],
       "properties": {"Node name for S&R": "RandomNoise"},
       "widgets_values": [0, "fixed"]
@@ -272,7 +249,7 @@
         {"name": "sampler_name", "type": "COMBO", "widget": {"name": "sampler_name"}, "link": null}
       ],
       "outputs": [
-        {"name": "SAMPLER", "type": "SAMPLER", "links": [22, 35]}
+        {"name": "SAMPLER", "type": "SAMPLER", "links": [22]}
       ],
       "properties": {"Node name for S&R": "KSamplerSelect"},
       "widgets_values": ["euler"]
@@ -292,7 +269,7 @@
         {"name": "denoise", "type": "FLOAT", "widget": {"name": "denoise"}, "link": null}
       ],
       "outputs": [
-        {"name": "SIGMAS", "type": "SIGMAS", "links": [23, 36]}
+        {"name": "SIGMAS", "type": "SIGMAS", "links": [23]}
       ],
       "properties": {"Node name for S&R": "BasicScheduler"},
       "widgets_values": ["simple", 8, 1]
@@ -331,55 +308,31 @@
         {"name": "latent_image", "type": "LATENT", "link": 19}
       ],
       "outputs": [
-        {"name": "output", "type": "LATENT", "links": [27]},
+        {"name": "output", "type": "LATENT", "links": [41]},
         {"name": "denoised_output", "type": "LATENT", "links": []}
       ],
       "properties": {"Node name for S&R": "SamplerCustomAdvanced"},
       "widgets_values": []
     },
     {
-      "id": 18,
-      "type": "VAEDecode",
+      "id": 19,
+      "type": "MosaicDiffPlace",
       "pos": [1740, 220],
-      "size": [250, 70],
+      "size": [320, 140],
       "flags": {},
       "order": 17,
       "mode": 0,
       "inputs": [
-        {"name": "samples", "type": "LATENT", "link": 27},
-        {"name": "vae", "type": "VAE", "link": 28}
-      ],
-      "outputs": [
-        {"name": "IMAGE", "type": "IMAGE", "links": [29]}
-      ],
-      "properties": {"Node name for S&R": "VAEDecode"},
-      "widgets_values": []
-    },
-    {
-      "id": 19,
-      "type": "MosaicDiffPlace",
-      "pos": [1740, 330],
-      "size": [320, 280],
-      "flags": {},
-      "order": 18,
-      "mode": 0,
-      "inputs": [
-        {"name": "images", "type": "IMAGE", "link": 29},
-        {"name": "prep", "type": "MOSAICDIFF_PREP", "link": 30},
-        {"name": "model", "type": "MODEL", "link": 31},
-        {"name": "clip", "type": "CLIP", "link": 32},
-        {"name": "vae", "type": "VAE", "link": 33},
-        {"name": "noise", "type": "NOISE", "link": 34},
-        {"name": "sampler", "type": "SAMPLER", "link": 35},
-        {"name": "sigmas", "type": "SIGMAS", "link": 36},
-        {"name": "prompt", "type": "STRING", "widget": {"name": "prompt"}, "link": 37}
+        {"name": "latent", "type": "LATENT", "link": 41},
+        {"name": "vae", "type": "VAE", "link": 42},
+        {"name": "prep", "type": "MOSAICDIFF_PREP", "link": 30}
       ],
       "outputs": [
         {"name": "video", "type": "VIDEO", "links": [38]},
         {"name": "preview", "type": "IMAGE", "links": [39]}
       ],
       "properties": {"Node name for S&R": "MosaicDiffPlace"},
-      "widgets_values": ["Restore the vulva or penis the reference video"]
+      "widgets_values": []
     },
     {
       "id": 20,
@@ -427,17 +380,12 @@
     [6, 3, 6, 9, 2, "INT"],
     [7, 7, 0, 11, 0, "CLIP"],
     [8, 8, 0, 11, 1, "VAE"],
-    [9, 3, 1, 11, 3, "IMAGE"],
-    [10, 10, 0, 11, 4, "STRING"],
-    [11, 3, 2, 11, 5, "INT"],
-    [12, 3, 3, 11, 6, "INT"],
-    [13, 3, 4, 11, 7, "INT"],
-    [14, 11, 1, 12, 0, "LATENT"],
-    [15, 3, 1, 12, 1, "IMAGE"],
-    [16, 8, 0, 12, 2, "VAE"],
-    [17, 3, 2, 12, 3, "INT"],
-    [18, 3, 3, 12, 4, "INT"],
-    [19, 12, 0, 17, 4, "LATENT"],
+    [10, 10, 0, 11, 2, "STRING"],
+    [11, 3, 2, 11, 4, "INT"],
+    [12, 3, 3, 11, 5, "INT"],
+    [13, 3, 4, 11, 6, "INT"],
+    [19, 11, 1, 17, 4, "LATENT"],
+    [40, 3, 0, 11, 3, "MOSAICDIFF_PREP"],
     [20, 13, 0, 17, 0, "NOISE"],
     [21, 16, 0, 17, 1, "GUIDER"],
     [22, 14, 0, 17, 2, "SAMPLER"],
@@ -445,17 +393,9 @@
     [24, 9, 0, 16, 0, "MODEL"],
     [25, 11, 0, 16, 1, "CONDITIONING"],
     [26, 9, 0, 15, 0, "MODEL"],
-    [27, 17, 0, 18, 0, "LATENT"],
-    [28, 8, 0, 18, 1, "VAE"],
-    [29, 18, 0, 19, 0, "IMAGE"],
-    [30, 3, 0, 19, 1, "MOSAICDIFF_PREP"],
-    [31, 9, 0, 19, 2, "MODEL"],
-    [32, 7, 0, 19, 3, "CLIP"],
-    [33, 8, 0, 19, 4, "VAE"],
-    [34, 13, 0, 19, 5, "NOISE"],
-    [35, 14, 0, 19, 6, "SAMPLER"],
-    [36, 15, 0, 19, 7, "SIGMAS"],
-    [37, 10, 0, 19, 8, "STRING"],
+    [30, 3, 0, 19, 2, "MOSAICDIFF_PREP"],
+    [41, 17, 0, 19, 0, "LATENT"],
+    [42, 8, 0, 19, 1, "VAE"],
     [38, 19, 0, 20, 0, "VIDEO"],
     [39, 19, 1, 21, 0, "IMAGE"]
   ],

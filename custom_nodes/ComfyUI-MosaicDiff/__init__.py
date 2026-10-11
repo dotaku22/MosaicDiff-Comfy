@@ -1,10 +1,12 @@
 import folder_paths
 from pathlib import Path
 
-_models = str(Path(__file__).resolve().parent / "models")
+_models = Path(__file__).resolve().parent / "models"
+_models.mkdir(parents=True, exist_ok=True)
 folders, extensions = folder_paths.folder_names_and_paths.setdefault("mosaicdiff", ([], {".onnx", ".pth"}))
-if _models not in folders:
-    folders.append(_models)
+text = str(_models)
+if text not in folders:
+    folders.append(text)
 extensions.update({".onnx", ".pth"})
 
 _lora_dir = str(Path(__file__).resolve().parent / "loras")

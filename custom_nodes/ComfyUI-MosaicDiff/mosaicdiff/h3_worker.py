@@ -1,11 +1,11 @@
-"""Run the tested MiniMax H3 ref2va graph with ComfyUI's Python.
+"""Run the tested MiniMax H3 ref2va graph. Executed with ComfyUI's Python, not Jasna's.
 
 One process loads the UNET, the Decensore LoRA, the Qwen3-VL text encoder, and
 the video VAE, then restores every region in the job file. Sampling matches
 ``VSR_restore.json``: euler, simple scheduler, 8 steps, denoise 1, BasicGuider
 (no CFG), ``ref_image_size`` match, and the Decensore LoRA at strength 1.
-The lightning LoRA in that graph is switched off. MiniMax H3 Context Windows
-splits a long region into overlapping pieces during that one sample.
+The lightning LoRA in that graph is switched off. A clip longer than the H3
+length stays one reference video. Context windows split the sampling.
 """
 
 from __future__ import annotations
@@ -19,9 +19,39 @@ import time
 from pathlib import Path
 
 
+class _Stamped:
+    """Prefix each output line with the clock time."""
+
+    def __init__(self, raw):
+        self.raw = raw
+        self.buf = ""
+
+    def write(self, data):
+        text = data if isinstance(data, str) else data.decode("utf-8", "replace")
+        self.buf += text
+        while "\n" in self.buf:
+            line, self.buf = self.buf.split("\n", 1)
+            self.raw.write(f"{time.strftime('%H:%M:%S')}  {line}\n")
+        return len(data)
+
+    def flush(self):
+        self.raw.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.raw, name)
+
+
+def _stamp_output() -> None:
+    if not isinstance(sys.stdout, _Stamped):
+        sys.stdout = _Stamped(sys.stdout)
+    if not isinstance(sys.stderr, _Stamped):
+        sys.stderr = _Stamped(sys.stderr)
+
+
 def _boot() -> None:
     import logging
 
+    _stamp_output()
     import comfy.options
 
     comfy.options.args_parsing = False
@@ -39,6 +69,13 @@ def _boot() -> None:
         os.environ["MIMALLOC_PURGE_DELAY"] = "0"
     import cuda_malloc  # noqa: F401
 
+    # Comfy Kitchen's INT8 attention stands in for sage attention when the
+    # sageattention package is absent. Checked after cuda_malloc so the torch
+    # import it triggers sees the allocator choice. MOSAICDIFF_CK_ATTENTION=0
+    # keeps PyTorch attention for comparison.
+    if not cli_args.args.use_sage_attention and os.environ.get("MOSAICDIFF_CK_ATTENTION", "1") != "0":
+        cli_args.args.use_ck_attention = _ck_attention_available()
+
     if not cli_args.enables_dynamic_vram():
         return
     import comfy_aimdo.control
@@ -54,6 +91,21 @@ def _boot() -> None:
             comfy_aimdo.control.init(simple_vram_headroom=headroom)
         except TypeError:
             comfy_aimdo.control.init()
+
+
+def _ck_attention_available() -> bool:
+    """True when comfy_kitchen ships its INT8 attention kernel for this card.
+
+    Older comfy-kitchen (0.2.26, the one ComfyUI 0.30 pins) has no
+    int8_attention_is_available, and that ComfyUI has no --use-ck-attention
+    either, so the flag stays off there and PyTorch attention is used.
+    """
+    try:
+        import comfy_kitchen
+
+        return bool(comfy_kitchen.int8_attention_is_available())
+    except (ImportError, AttributeError):
+        return False
 
 
 def _enable_dynamic_vram() -> None:
@@ -186,7 +238,21 @@ def _gpu_line() -> str:
     return f"{(total - free) / 1024 ** 3:.1f} GiB used, {free / 1024 ** 3:.1f} GiB free"
 
 
+_release_models = True
+
+
 def _free_other_models() -> None:
+    """Give the VAE the card. Comfy unloads the diffusion model and text encoder
+
+    Skipped while the H3 pieces are sampling, so the UNET is not evicted
+    between pieces and loaded again for the next one.
+    """
+    if not _release_models:
+        return
+    _free_other_models_now()
+
+
+def _free_other_models_now() -> None:
     """Give the VAE the card. Comfy unloads the diffusion model and text encoder
     before a VAE node; leaving them resident makes this VAE miss its normal
     encode and fall back to the slow tiled path.
@@ -194,22 +260,68 @@ def _free_other_models() -> None:
     import comfy.model_management as model_management
 
     model_management.unload_all_models()
+    _end_node()
     model_management.soft_empty_cache()
+
+
+def _end_node() -> None:
+    """Release what ComfyUI's executor releases after every node.
+
+    unload_all_models only evicts model weights. With dynamic VRAM the UNET
+    forward also leaves behind the comfy-aimdo allocation plan (malloc graph,
+    sized to the activations of the largest sampling window) and the weight
+    cast buffers. Neither is evictable under VRAM pressure, so without this a
+    362-frame sample kept about 6 GiB and the next sample's text encoder ran
+    out of memory. Same three calls as ComfyUI's execution.py, in that order.
+    """
+    try:
+        import comfy.memory_management
+        import comfy.model_management
+        import comfy.model_prefetch
+        import comfy_aimdo.model_vbar
+    except ImportError:
+        # A ComfyUI without dynamic VRAM has nothing of this to release.
+        return
+    if not getattr(comfy.memory_management, "aimdo_enabled", False):
+        return
+    comfy.model_prefetch.cleanup_prefetch_queues()
+    comfy.model_management.reset_cast_buffers()
+    comfy_aimdo.model_vbar.vbars_reset_watermark_limits()
 
 
 def _watch_progress() -> None:
     import comfy.utils
 
-    last = {"step": None}
+    # Comfy reports a step after it finishes. The line below is printed when
+    # the step starts, from _sample_showing_steps.
+    comfy.utils.set_progress_bar_global_hook(lambda *_args, **_kwargs: None)
 
-    def hook(current, total, preview=None, node_id=None):
-        step = int(current)
-        if step == last["step"]:
-            return
-        last["step"] = step
-        print(f"Sampling step {step}/{int(total)}", flush=True)
 
-    comfy.utils.set_progress_bar_global_hook(hook)
+def _sample_showing_steps(sample, noise, guider, sampler, sigmas, latent, steps: int):
+    import comfy.samplers
+
+    original = comfy.samplers.CFGGuider.predict_noise
+    state = {"n": 0, "started": 0.0}
+
+    def predict_noise(self, x, timestep, model_options={}, seed=None):
+        now = time.perf_counter()
+        if state["n"]:
+            print(f"Sampling step {state['n']}/{steps} done in {now - state['started']:.0f}s", flush=True)
+        state["n"] += 1
+        state["started"] = now
+        print(f"Sampling step {state['n']}/{steps}", flush=True)
+        return original(self, x, timestep, model_options=model_options, seed=seed)
+
+    comfy.samplers.CFGGuider.predict_noise = predict_noise
+    try:
+        return sample.execute(noise, guider, sampler, sigmas, latent)[0]
+    finally:
+        comfy.samplers.CFGGuider.predict_noise = original
+        if state["n"]:
+            print(
+                f"Sampling step {state['n']}/{steps} done in {time.perf_counter() - state['started']:.0f}s",
+                flush=True,
+            )
 
 
 def _watch_vae(vae) -> None:
@@ -323,17 +435,19 @@ def _rtx_node(job: dict):
     return module
 
 
-def _rtx_fit(job: dict, images, gen_w: int, gen_h: int, crop_w: int, crop_h: int):
+def _rtx_fit(job: dict, images, gen_w: int, gen_h: int, crop_w: int, crop_h: int, announce: bool = True, release: bool = True):
     """Upscale the H3 frames with RTX Video Super Resolution, then fit the crop."""
     import comfy.utils
 
     cover = max(crop_w / gen_w, crop_h / gen_h, 2.0)
     scale = min(4.0, cover)
-    print(
-        f"RTX upscale {gen_w}x{gen_h} by {scale:.2f}, then fit {crop_w}x{crop_h}",
-        flush=True,
-    )
-    _free_other_models()
+    if announce:
+        print(
+            f"RTX upscale {gen_w}x{gen_h} by {scale:.2f}, then fit {crop_w}x{crop_h}",
+            flush=True,
+        )
+    if release:
+        _free_other_models()
     module = _rtx_node(job)
     upscaled = module.RTXVideoSuperResolution.execute(
         images,
@@ -359,10 +473,20 @@ def _read_crop(frame, crop: list[int]):
     return image.copy()
 
 
+def _crop_for_frame(window: dict, frame_idx: int) -> list[int]:
+    crops = window.get("crops")
+    if not crops:
+        return window["crop"]
+    frames = [int(frame) for frame in window["frame_indices"]]
+    return crops[frames.index(int(frame_idx))]
+
+
 def _stream_windows(loaded, job: dict) -> None:
-    """Read the VSR video once, crop each sample, and restore it before reading on.
+    """Read the restored video once, then sample every piece before upscaling.
 
     Crops are taken here so the full frames are not written out as images.
+    BasicVSR++ has already run on the whole file. H3 then runs every piece,
+    and RTX Video Super Resolution runs after that.
     """
     import cv2
 
@@ -371,6 +495,7 @@ def _stream_windows(loaded, job: dict) -> None:
         {"window": window, "need": set(int(frame) for frame in window["frame_indices"]), "got": {}}
         for window in windows
     ]
+    ready = []
     capture = cv2.VideoCapture(job["video"])
     if not capture.isOpened():
         raise RuntimeError(f"Could not open {job['video']}")
@@ -380,17 +505,15 @@ def _stream_windows(loaded, job: dict) -> None:
             ok, frame = capture.read()
             if not ok:
                 break
-            ready = []
+            done = []
             for item in pending:
                 if frame_idx not in item["need"]:
                     continue
-                item["got"][frame_idx] = _read_crop(frame, item["window"]["crop"])
+                item["got"][frame_idx] = _read_crop(frame, _crop_for_frame(item["window"], frame_idx))
                 if len(item["got"]) == len(item["need"]):
-                    ready.append(item)
-            for item in ready:
-                number = windows.index(item["window"]) + 1
-                print(f"Sample {number}/{len(windows)}", flush=True)
-                _restore_window(loaded, job, item["window"], item["got"])
+                    done.append(item)
+            for item in done:
+                ready.append((item["window"], _stack_frames(loaded, item["window"], item["got"])))
                 item["got"].clear()
                 pending.remove(item)
             frame_idx += 1
@@ -399,6 +522,7 @@ def _stream_windows(loaded, job: dict) -> None:
     if pending:
         missing = sorted(pending[0]["need"] - set(pending[0]["got"]))[:8]
         raise RuntimeError(f"VSR video ended before H3 frame(s) {missing}")
+    _run_h3(loaded, job, ready)
 
 
 def _fit_reference(frames, width: int, height: int):
@@ -418,35 +542,105 @@ def _fit_reference(frames, width: int, height: int):
     ).movedim(1, -1)
 
 
-def _restore_window(loaded, job: dict, window: dict, crops: dict | None = None) -> None:
+def _align_down_count(count: int) -> int:
+    if count < 5:
+        return 0
+    drop = (count % 17 - 5) % 17
+    aligned = count - drop
+    return aligned if aligned >= 5 else 0
+
+
+def _align_up_count(count: int) -> int:
+    count = max(5, int(count))
+    while count % 17 != 5:
+        count += 1
+    return count
+
+
+def _piece_spans(total: int, context: int, overlap: int) -> list[tuple[int, int]]:
+    """Pieces no longer than the H3 length, sharing about one second.
+
+    The last piece is the tail plus that overlap. A 15 second region is not
+    sampled as one block when the H3 length is shorter than that.
+    """
+    total = int(total)
+    context = int(context)
+    if context % 17 != 5:
+        context = _align_down_count(context)
+    if context < 5:
+        context = _align_down_count(total)
+    overlap = 22 if context > 22 else 0
+    if total <= context:
+        count = total if total % 17 == 5 else _align_down_count(total)
+        return [(0, count)] if count >= 5 else []
+    stride = context - overlap
+    spans: list[tuple[int, int]] = []
+    start = 0
+    while start < total:
+        remaining = total - start
+        if remaining <= context:
+            count = remaining if remaining % 17 == 5 else _align_down_count(remaining)
+            if count >= 5:
+                spans.append((start, count))
+            break
+        tail_room = total - (start + stride)
+        if tail_room <= context:
+            tail = tail_room if tail_room % 17 == 5 else _align_up_count(tail_room)
+            if tail > context:
+                tail = _align_down_count(min(context, max(tail_room, 5)))
+            if tail < 5:
+                spans.append((start, context))
+                start += stride
+                continue
+            spans.append((start, context))
+            spans.append((total - tail, tail))
+            break
+        spans.append((start, context))
+        start += stride
+    return spans
+
+
+def _to_device(value, device, detach=False):
+    import torch
+    from comfy.nested_tensor import NestedTensor
+
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach() if detach else value
+        return tensor.to(device)
+    if isinstance(value, NestedTensor):
+        return NestedTensor(_to_device(tensor, device, detach) for tensor in value.tensors)
+    if isinstance(value, dict):
+        return {key: _to_device(item, device, detach) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_to_device(item, device, detach) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_to_device(item, device, detach) for item in value)
+    return value
+
+
+def _to_cpu(value):
+    return _to_device(value, "cpu", detach=True)
+
+
+def _stack_frames(loaded, window, crops):
     torch = loaded["torch"]
-    started = time.perf_counter()
     if crops is None:
         print(f"Reading {len(window['frames'])} frames", flush=True)
-        frames = _read_frames(torch, loaded["Image"], window["frames"])
-    else:
-        import numpy as np
+        return _read_frames(torch, loaded["Image"], window["frames"])
+    import numpy as np
 
-        print(f"Reading {len(window['frame_indices'])} frames", flush=True)
-        ordered = []
-        for frame_idx in window["frame_indices"]:
-            bgr = crops[int(frame_idx)]
-            rgb = torch.from_numpy(np.ascontiguousarray(bgr[:, :, ::-1])).float().div_(255.0)
-            ordered.append(rgb)
-        frames = torch.stack(ordered, dim=0)
+    print(f"Reading {len(window['frame_indices'])} frames", flush=True)
+    ordered = []
+    for frame_idx in window["frame_indices"]:
+        bgr = crops[int(frame_idx)]
+        rgb = torch.from_numpy(np.ascontiguousarray(bgr[:, :, ::-1])).float().div_(255.0)
+        ordered.append(rgb)
+    return torch.stack(ordered, dim=0)
+
+
+def _condition_piece(loaded, job, window, frames, width, height):
+    frames = _fit_reference(frames.contiguous(), width, height)
     length = int(frames.shape[0])
-    width = int(window["width"])
-    height = int(window["height"])
-    loaded["model"] = _apply_context(
-        loaded["base_model"],
-        {
-            "comfy_root": job["comfy_root"],
-            "nodes_dir": job.get("nodes_dir"),
-            "context_frames": int(window.get("context_frames", job.get("context_frames", 124))),
-            "context_overlap": int(window.get("context_overlap", job.get("context_overlap", 22))),
-        },
-    )
-    frames = _fit_reference(frames, width, height)
     print(
         f"Conditioning {length} frames, generation {width}x{height}, reference {frames.shape[2]}x{frames.shape[1]}",
         flush=True,
@@ -464,15 +658,44 @@ def _restore_window(loaded, job: dict, window: dict, crops: dict | None = None) 
     )
     positive, latent = conditioned[0], conditioned[1]
     _pin_reference_border(loaded, latent, frames, width, height, window.get("mask"))
-    print(f"Sampling {int(job['steps'])} steps", flush=True)
-    guider = loaded["guider"].execute(loaded["model"], positive)[0]
-    sigmas = loaded["scheduler"].execute(loaded["model"], "simple", int(job["steps"]), 1.0)[0]
-    sampler = loaded["sampler"].execute("euler")[0]
-    noise = loaded["noise"].execute(int(job["seed"]))[0]
-    sampled = loaded["sample"].execute(noise, guider, sampler, sigmas, latent)[0]
-    images = loaded["decode"].decode(loaded["vae"], sampled)[0]
-    if images.shape[0] != length:
-        raise RuntimeError(f"H3 decoded {images.shape[0]} frames, expected {length}")
+    held = (_to_cpu(positive), _to_cpu(latent))
+    del frames, positive, latent, conditioned
+    return held
+
+
+def _blend_pieces(parts, spans, total):
+    import torch
+
+    ref = parts[0]
+    acc = ref.new_zeros((total, *ref.shape[1:]))
+    weight = ref.new_zeros((total, 1, 1, 1))
+    ranges = [(start, start + count) for start, count in spans]
+    for (start, count), frames in zip(spans, parts):
+        ramp = frames.new_ones((count, 1, 1, 1))
+        end = start + count
+        for other_start, other_end in ranges:
+            if other_start == start and other_end == end:
+                continue
+            lo = max(start, other_start)
+            hi = min(end, other_end)
+            if hi <= lo:
+                continue
+            local = lo - start
+            length = hi - lo
+            fade = torch.linspace(0, 1, length, device=frames.device, dtype=frames.dtype)
+            if other_start > start:
+                fade = fade.flip(0)
+            ramp[local : local + length] *= fade.view(length, 1, 1, 1)
+        acc[start:end] += frames * ramp
+        weight[start:end] += ramp
+    if bool((weight <= 0).any()):
+        raise RuntimeError("H3 pieces left a gap")
+    return acc / weight
+
+
+def _write_window(loaded, job, window, images) -> None:
+    width = int(window["width"])
+    height = int(window["height"])
     crop = window.get("crop")
     if crop:
         crop_w = int(crop[2]) - int(crop[0])
@@ -482,13 +705,86 @@ def _restore_window(loaded, job: dict, window: dict, crops: dict | None = None) 
     images = _rtx_fit(job, images, width, height, crop_w, crop_h)
     out_dir = Path(window["out_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Writing {length} frames", flush=True)
-    for index in range(length):
-        array = images[index].clamp(0, 1).mul(255).round().to(dtype=torch.uint8).cpu().numpy()
+    print(f"Writing {int(images.shape[0])} frames", flush=True)
+    for index in range(int(images.shape[0])):
+        array = images[index].clamp(0, 1).mul(255).round().to(dtype=loaded["torch"].uint8).cpu().numpy()
         loaded["Image"].fromarray(array).save(out_dir / f"{index:06d}.png")
-    print(f"Window finished in {time.perf_counter() - started:.1f}s", flush=True)
-    del frames, positive, latent, sampled, images
-    torch.cuda.empty_cache()
+
+
+def _run_h3(loaded, job, ready) -> None:
+    """Sample each cropped clip once. Context windows handle a clip longer than the H3 length."""
+    global _release_models
+
+    if not ready:
+        raise RuntimeError("No H3 clip to sample")
+    context = max(int(window.get("context_frames", job.get("context_frames", 124))) for window, _frames in ready)
+    overlap = max(int(window.get("context_overlap", job.get("context_overlap", 22))) for window, _frames in ready)
+    _release_models = True
+    _free_other_models()
+    _release_models = False
+    loaded["model"] = _apply_context(
+        loaded["base_model"],
+        {
+            "comfy_root": job["comfy_root"],
+            "nodes_dir": job.get("nodes_dir"),
+            "context_frames": context,
+            "context_overlap": overlap,
+        },
+    )
+    steps = int(job["steps"])
+    conditioned = []
+    for number, (window, frames) in enumerate(ready, start=1):
+        count = _align_down_count(int(frames.shape[0]))
+        if count < 5:
+            raise RuntimeError("The restored section is shorter than 5 frames at 24 fps")
+        if count != int(frames.shape[0]):
+            print(
+                f"H3 keeps {count} of {int(frames.shape[0])} frames so the length matches the model",
+                flush=True,
+            )
+            frames = frames[:count]
+            window["frame_indices"] = list(window["frame_indices"])[:count]
+            if window.get("crops"):
+                window["crops"] = list(window["crops"])[:count]
+        print(f"Sample {number}: {count} frames, context {context}, overlap {overlap}", flush=True)
+        positive, latent = _condition_piece(
+            loaded, job, window, frames, int(window["width"]), int(window["height"])
+        )
+        conditioned.append((window, positive, latent, count))
+        del frames
+    ready.clear()
+    sampled_windows = []
+    try:
+        import comfy.model_management
+
+        device = comfy.model_management.get_torch_device()
+        for number, (window, positive, latent, count) in enumerate(conditioned, start=1):
+            print(f"Sampling {number}/{len(conditioned)}, {count} frames", flush=True)
+            positive = _to_device(positive, device)
+            latent = _to_device(latent, device)
+            guider = loaded["guider"].execute(loaded["model"], positive)[0]
+            sigmas = loaded["scheduler"].execute(loaded["model"], "simple", steps, 1.0)[0]
+            sampler = loaded["sampler"].execute("euler")[0]
+            noise = loaded["noise"].execute(int(job["seed"]))[0]
+            sampled = _sample_showing_steps(
+                loaded["sample"], noise, guider, sampler, sigmas, latent, steps
+            )
+            sampled_windows.append((window, _to_cpu(sampled), count))
+            del guider, sigmas, sampler, noise, sampled
+    finally:
+        _release_models = True
+
+    print("H3 sampling finished. Decoding, then RTX upscale.", flush=True)
+    for window, sampled, count in sampled_windows:
+        _release_models = True
+        images = loaded["decode"].decode(loaded["vae"], sampled)[0]
+        _release_models = False
+        if int(images.shape[0]) != count:
+            raise RuntimeError(f"H3 decoded {int(images.shape[0])} frames, expected {count}")
+        _release_models = True
+        _write_window(loaded, job, window, images.detach().cpu())
+        del sampled, images
+    _free_other_models()
 
 
 def main() -> None:
@@ -509,9 +805,11 @@ def main() -> None:
         if job.get("video"):
             _stream_windows(loaded, job)
         else:
-            for index, window in enumerate(windows, start=1):
-                print(f"Sample {index}/{len(windows)}", flush=True)
-                _restore_window(loaded, job, window)
+            _run_h3(
+                loaded,
+                job,
+                [(window, _stack_frames(loaded, window, None)) for window in windows],
+            )
     print("MiniMax H3 pass finished", flush=True)
 
 
